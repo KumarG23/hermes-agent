@@ -2131,6 +2131,10 @@ _USAGE_STATE: Dict[str, Any] = {
     "session_cache_read_tokens": 0,
     "session_cache_write_tokens": 0,
     "session_reasoning_tokens": 0,
+    # Per-agent provider telemetry. API-server /v1/runs creates one agent per
+    # run, so these become durable turn metrics without scraping logs.
+    "session_provider_latency_seconds": 0.0,
+    "session_max_prompt_tokens": 0,
     "session_estimated_cost_usd": 0.0,
     "session_cost_status": "unknown",
     "session_cost_source": "none",

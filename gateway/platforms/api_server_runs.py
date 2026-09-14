@@ -36,7 +36,9 @@ _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
 # Terminal usage payload: (wire key, agent attribute), in wire order.
 _USAGE_FIELDS = (
     ("input_tokens", "session_prompt_tokens"), ("output_tokens", "session_completion_tokens"),
-    ("total_tokens", "session_total_tokens"))
+    ("total_tokens", "session_total_tokens"), ("reasoning_tokens", "session_reasoning_tokens"),
+    ("cache_read_tokens", "session_cache_read_tokens"),
+    ("cache_write_tokens", "session_cache_write_tokens"), ("api_calls", "session_api_calls"))
 # Tool-progress event -> SSE payload fields (tool_name, preview, kwargs); key order is wire format.
 _FIXED_EVENT_FIELDS = {
     "tool.started": lambda tool, preview, kw: {"tool": tool, "preview": preview},
@@ -447,7 +449,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
-            **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
+            **{k: agent_overrides.get(k) for k in (
+                "requested_model", "requested_provider", "model_options", "confirmed_runtime_lock")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
@@ -512,7 +515,67 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
-        return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
+        def _number(value: Any, *, integer: bool = True):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0
+            return max(0, int(value) if integer else float(value))
+
+        def _text(value: Any) -> Optional[str]:
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        usage: Dict[str, Any] = {
+            key: _number(getattr(agent, attr, 0)) for key, attr in _USAGE_FIELDS}
+        provider_latency = _number(
+            getattr(agent, "session_provider_latency_seconds", 0.0), integer=False)
+        usage["provider_latency_ms"] = round(provider_latency * 1000)
+        usage["output_tokens_per_second"] = (
+            round(float(usage["output_tokens"]) / provider_latency, 2)
+            if provider_latency > 0 and usage["output_tokens"] > 0 else None)
+        compressor = getattr(agent, "context_compressor", None)
+        context_limit = _number(getattr(compressor, "context_length", 0))
+        context_used = max(
+            _number(getattr(agent, "session_max_prompt_tokens", 0)),
+            _number(getattr(compressor, "last_prompt_tokens", 0)))
+        usage["context"] = ({
+            "used_tokens": context_used,
+            "limit_tokens": context_limit,
+            "source": "hermes_effective",
+        } if context_limit > 0 and context_used > 0 else None)
+
+        model_options = run.agent_kwargs.get("model_options") or {}
+        requested_reasoning = model_options.get("reasoning") if isinstance(model_options, dict) else None
+        requested_effort = _text(
+            requested_reasoning.get("effort") if isinstance(requested_reasoning, dict) else None)
+        transport = None
+        with suppress(Exception):
+            transport = agent._get_transport()
+        wire_effort = _text(getattr(transport, "last_reasoning_effort", None))
+        configured = getattr(agent, "reasoning_config", None)
+        configured_effort = (
+            "none" if isinstance(configured, dict) and configured.get("enabled") is False
+            else _text(configured.get("effort")) if isinstance(configured, dict) else None)
+        requested_provider = _text(run.agent_kwargs.get("requested_provider"))
+        requested_model = _text(run.agent_kwargs.get("requested_model"))
+        executed_provider = _text(getattr(agent, "provider", None)) or "unknown"
+        executed_model = _text(getattr(agent, "model", None)) or "unknown"
+        runtime_value = getattr(agent, "_hermes_api_runtime", None)
+        runtime = runtime_value if isinstance(runtime_value, dict) else {}
+        usage["execution"] = {
+            "requested": {
+                "provider": requested_provider, "model": requested_model,
+                "reasoning_effort": requested_effort},
+            "executed": {
+                "provider": executed_provider, "model": executed_model,
+                "reasoning_effort": wire_effort or configured_effort,
+                "reasoning_effort_source": "wire" if wire_effort is not None else (
+                    "configured" if configured_effort is not None else "unknown")},
+            "route_source": str(runtime.get("route_source") or "unknown"),
+            "exact": bool(run.agent_kwargs.get("confirmed_runtime_lock")),
+            "fallback_used": bool(
+                (requested_provider and requested_provider != executed_provider)
+                or (requested_model and requested_model != executed_model)),
+        }
+        return r, usage
 
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
@@ -543,6 +606,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    run_started = time.monotonic()
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -580,6 +644,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
+            usage["end_to_end_latency_ms"] = round(max(0.0, time.monotonic() - run_started) * 1000)
             _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
     except asyncio.CancelledError:
         _finish("cancelled")

@@ -355,6 +355,8 @@ def _request_agent_overrides(
     model_options = body.get("model_options")
     if isinstance(model_options, dict):
         overrides["model_options"] = dict(model_options)
+    if body.get("require_model_lock") is True:
+        overrides["confirmed_runtime_lock"] = True
     return overrides
 
 

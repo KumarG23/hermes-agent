@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -324,6 +325,88 @@ class TestStartRun:
 
 
 class TestRunStatus:
+
+    @pytest.mark.asyncio
+    async def test_completed_status_persists_executed_receipt_and_measured_metrics(self, adapter):
+        app = _create_runs_app(adapter)
+
+        class FakeAgent:
+            provider = "actual-provider"
+            model = "actual-model"
+            reasoning_config = {"enabled": True, "effort": "low"}
+            session_prompt_tokens = 120
+            session_completion_tokens = 40
+            session_total_tokens = 160
+            session_reasoning_tokens = 8
+            session_cache_read_tokens = 80
+            session_cache_write_tokens = 0
+            session_api_calls = 2
+            session_provider_latency_seconds = 2.0
+            session_max_prompt_tokens = 90
+            context_compressor = SimpleNamespace(context_length=1000, last_prompt_tokens=75)
+            _hermes_api_runtime = {"route_source": "raw_request"}
+
+            @staticmethod
+            def _get_transport():
+                return SimpleNamespace(last_reasoning_effort="low")
+
+            @staticmethod
+            def run_conversation(user_message, conversation_history, task_id):
+                return {"final_response": "done"}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=FakeAgent()) as create:
+                started = await cli.post("/v1/runs", json={
+                    "input": "hello",
+                    "provider": "actual-provider",
+                    "model": "actual-model",
+                    "model_options": {"reasoning": {"enabled": True, "effort": "low"}},
+                    "require_model_lock": True,
+                })
+                run_id = (await started.json())["run_id"]
+                status = {}
+                for _ in range(40):
+                    response = await cli.get(f"/v1/runs/{run_id}")
+                    status = await response.json()
+                    if status.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert create.call_args.kwargs["confirmed_runtime_lock"] is True
+        assert status["usage"] == {
+            "input_tokens": 120,
+            "output_tokens": 40,
+            "total_tokens": 160,
+            "reasoning_tokens": 8,
+            "cache_read_tokens": 80,
+            "cache_write_tokens": 0,
+            "api_calls": 2,
+            "provider_latency_ms": 2000,
+            "output_tokens_per_second": 20.0,
+            "context": {
+                "used_tokens": 90,
+                "limit_tokens": 1000,
+                "source": "hermes_effective",
+            },
+            "execution": {
+                "requested": {
+                    "provider": "actual-provider",
+                    "model": "actual-model",
+                    "reasoning_effort": "low",
+                },
+                "executed": {
+                    "provider": "actual-provider",
+                    "model": "actual-model",
+                    "reasoning_effort": "low",
+                    "reasoning_effort_source": "wire",
+                },
+                "route_source": "raw_request",
+                "exact": True,
+                "fallback_used": False,
+            },
+            "end_to_end_latency_ms": status["usage"]["end_to_end_latency_ms"],
+        }
+        assert status["usage"]["end_to_end_latency_ms"] >= 0
 
     @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):

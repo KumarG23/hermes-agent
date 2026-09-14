@@ -500,6 +500,9 @@ class ResponsesApiTransport(ProviderTransport):
         native_compaction_active = _native_compaction_active(context_management)
 
         reasoning_effort, reasoning_enabled = _resolve_reasoning(model, params)
+        # Sanitized post-build receipt for API-server run telemetry. This is the
+        # clamped value placed on the provider wire, not merely requested config.
+        self.last_reasoning_effort = str(reasoning_effort) if reasoning_enabled else "none"
         response_tools, self._last_wire_aliases = _alias_wire_tools(self.convert_tools(tools), params, is_xai_responses)
 
         # Lazy: provider plugins import this transport during model_metadata init.

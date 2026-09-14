@@ -20,6 +20,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.conversation_compression import COMPACTION_HEARTBEAT_STATUS, COMPACTION_STATUS
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -28,6 +29,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_runs import _RunLaunch, _make_run_compaction_callbacks
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 
@@ -76,6 +78,41 @@ def _claim_run(adapter: APIServerAdapter, run_id: str) -> None:
     request = MagicMock()
     request.headers = {}
     adapter._run_owners[run_id] = adapter._run_idempotency_scope(request)
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_callbacks_emit_typed_lifecycle_and_persist_state():
+    adapter = _make_adapter()
+    run_id = "run_" + "c" * 32
+    queue = asyncio.Queue()
+    run = _RunLaunch(
+        owner=adapter, run_id=run_id, queue=queue, session_id="session-context",
+        gateway_session_key=None, declared_selected=False, user_message="test",
+        conversation_history=[], agent_kwargs={}, request_profile=None,
+        browser_control_principal=None, browser_control_transport_family=None,
+    )
+    adapter._run_streams[run_id] = queue
+    adapter._run_statuses[run_id] = {"status": "running"}
+    status_callback, event_callback = _make_run_compaction_callbacks(
+        adapter, run, asyncio.get_running_loop())
+
+    status_callback("status", COMPACTION_STATUS)
+    await asyncio.sleep(0)
+    started = await queue.get()
+    assert started["event"] == "context.compaction.started"
+    assert started["state"] == "running"
+
+    status_callback("status", COMPACTION_HEARTBEAT_STATUS)
+    await asyncio.sleep(0)
+    assert (await queue.get())["event"] == "context.compaction.progress"
+
+    event_callback("session:compress", {"messages_before": 100, "messages_after": 30})
+    await asyncio.sleep(0)
+    completed = await queue.get()
+    assert completed["event"] == "context.compaction.completed"
+    state = adapter._run_statuses[run_id]["compaction"]
+    assert state["state"] == "completed"
+    assert state["started_at"] <= state["updated_at"]
 
 
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:

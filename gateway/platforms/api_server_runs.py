@@ -179,6 +179,46 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
     return _callback
 
 
+def _make_run_compaction_callbacks(self, run: "_RunLaunch", loop: "asyncio.AbstractEventLoop"):
+    """Translate canonical agent compaction callbacks into bounded run lifecycle events."""
+    started_at: Optional[float] = None
+
+    def _publish(name: str, state: str) -> None:
+        nonlocal started_at
+        event = _run_event(run.run_id, name, state=state)
+        if started_at is None:
+            started_at = event["timestamp"]
+        compaction = {
+            "state": state,
+            "started_at": started_at,
+            "updated_at": event["timestamp"],
+        }
+        self._set_run_status(
+            run.run_id,
+            self._run_statuses.get(run.run_id, {}).get("status", "running"),
+            last_event=name,
+            compaction=compaction,
+        )
+        with suppress(Exception):
+            loop.call_soon_threadsafe(run.put_event, event)
+
+    def _status_callback(kind: str, message: str) -> None:
+        if kind == "compacted":
+            return
+        from agent.conversation_compression import is_compaction_progress_status
+        if is_compaction_progress_status(message):
+            _publish(
+                "context.compaction.started" if started_at is None else "context.compaction.progress",
+                "running",
+            )
+
+    def _event_callback(event_type: str, _payload: Any = None) -> None:
+        if event_type == "session:compress":
+            _publish("context.compaction.completed", "completed")
+
+    return _status_callback, _event_callback
+
+
 def _room_permission_for(request: "web.Request") -> str:
     if request.path.endswith("/stop"):
         return "stop"
@@ -617,6 +657,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
         extra = extra or {}
+        compaction = self._run_statuses.get(run_id, {}).get("compaction")
+        if isinstance(compaction, dict) and compaction.get("state") == "running":
+            settled = {**compaction, "state": "aborted", "updated_at": time.time()}
+            extra = {**extra, "compaction": settled}
+            with suppress(Exception):
+                run.put_event(_run_event(run_id, "context.compaction.aborted", state="aborted"))
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
@@ -627,8 +673,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
+            status_callback, event_callback = _make_run_compaction_callbacks(self, run, loop)
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                status_callback=status_callback, event_callback=event_callback,
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)

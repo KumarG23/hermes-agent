@@ -66,6 +66,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_fork_preserves_source"] is True
     assert features["run_steer"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
@@ -80,6 +81,39 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/v1/runs/{run_id}/steer",
     }
+
+
+@pytest.mark.asyncio
+async def test_fork_copies_history_without_ending_or_mutating_source(adapter, session_db):
+    source_id = session_db.create_session("fork-source", "api_server")
+    original = [
+        {"role": "user", "content": "Keep the source alive."},
+        {"role": "assistant", "content": "Copied, not consumed."},
+    ]
+    session_db.replace_messages(source_id, original)
+    source_before = session_db.get_messages(source_id)
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={"id": "fork-child", "title": "Safe fork"},
+        )
+        assert resp.status == 201
+        payload = await resp.json()
+
+    source = session_db.get_session(source_id)
+    child = session_db.get_session("fork-child")
+    assert payload["session"]["id"] == "fork-child"
+    assert source["ended_at"] is None
+    assert source["end_reason"] is None
+    assert child["parent_session_id"] == source_id
+    source_after = session_db.get_messages(source_id)
+    child_messages = session_db.get_messages("fork-child")
+    assert source_after == source_before
+    assert [(row["role"], row["content"]) for row in child_messages] == [
+        (row["role"], row["content"]) for row in source_before
+    ]
 
 
 @pytest.mark.asyncio

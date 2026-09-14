@@ -68,7 +68,8 @@ _STATIC_FEATURE_FLAGS = {
     "run_status": True, "run_events_sse": True, "run_stop": True, "run_steer": True,
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
-    "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
+    "session_chat_streaming": True, "session_fork": True, "session_fork_preserves_source": True,
+    "session_model_lock": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
@@ -2101,7 +2102,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _create_agent(
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
-        tool_complete_callback=None, gateway_session_key: Optional[str] = None,
+        tool_complete_callback=None, status_callback=None, event_callback=None,
+        gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None, requested_provider: Optional[str] = None,
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
@@ -2154,6 +2156,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "status_callback": status_callback,
+            "event_callback": event_callback,
             "session_db": self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
@@ -2959,8 +2963,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if await asyncio.to_thread(db.get_session, fork_id):
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
 
-        # CLI /branch semantics: end the original as branched, create a child with the transcript.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
+        # API fork is copy semantics: the source remains active and writable. CLI /branch intentionally
+        # switches away from its source, but a browser-side Fork must never mutate another open view.
         await asyncio.to_thread(
             db.create_session, fork_id, "api_server", model=source.get("model"),
             system_prompt=source.get("system_prompt"), parent_session_id=source_id)

@@ -69,7 +69,7 @@ _STATIC_FEATURE_FLAGS = {
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_fork_preserves_source": True,
-    "session_model_lock": True,
+    "session_compaction_runs": True, "session_model_lock": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
@@ -3767,6 +3767,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
+
+    @_admit_api_agent_request
+    async def _handle_context_compaction_runs(self, request: "web.Request") -> "web.Response":
+        return await _api_runs._handle_context_compaction_runs(
+            self, request, _api_server=sys.modules[__name__])
 
     def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
         return _api_runs._request_owns_run(self, request, run_id)

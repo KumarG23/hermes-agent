@@ -14,6 +14,7 @@ import hashlib
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,7 +30,8 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
-from gateway.platforms.api_server_runs import _RunLaunch, _make_run_compaction_callbacks
+from gateway.platforms.api_server_runs import (
+    _RunLaunch, _compact_session_sync, _make_run_compaction_callbacks)
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 
@@ -115,12 +117,190 @@ async def test_run_compaction_callbacks_emit_typed_lifecycle_and_persist_state()
     assert state["started_at"] <= state["updated_at"]
 
 
+@pytest.mark.asyncio
+async def test_context_compaction_admission_replays_exact_request_and_conflicts_on_session(
+    auth_adapter, monkeypatch,
+):
+    from gateway.platforms import api_server_runs
+
+    db = auth_adapter._ensure_session_db()
+    for session_id in ("api_compact_one", "api_compact_two"):
+        db.create_session(session_id=session_id, source="api_server")
+    release = asyncio.Event()
+
+    async def _held_operation(adapter, launch, *, _api_server):
+        await release.wait()
+        adapter._set_run_status(
+            launch.run_id, "completed", session_id=launch.session_id,
+            kind="context_compaction")
+        launch.put_event(None)
+        adapter._active_run_agents.pop(launch.run_id, None)
+        adapter._active_run_tasks.pop(launch.run_id, None)
+
+    monkeypatch.setattr(api_server_runs, "_execute_context_compaction", _held_operation)
+    app = _create_runs_app(auth_adapter)
+    async with TestClient(TestServer(app)) as client:
+        headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "compact-once"}
+        first = await client.post(
+            "/v1/runs/context-compactions", json={"session_id": "api_compact_one"}, headers=headers)
+        replay = await client.post(
+            "/v1/runs/context-compactions", json={"session_id": "api_compact_one"}, headers=headers)
+        conflict = await client.post(
+            "/v1/runs/context-compactions", json={"session_id": "api_compact_two"}, headers=headers)
+        assert first.status == replay.status == 202
+        assert (await first.json())["run_id"] == (await replay.json())["run_id"]
+        assert replay.headers["Idempotency-Replayed"] == "true"
+        assert conflict.status == 409
+        assert (await conflict.json())["error"]["code"] == "idempotency_key_conflict"
+        tasks = list(auth_adapter._active_run_tasks.values())
+        release.set()
+        await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_task_persists_typed_terminal_status_and_closes_agent(
+    auth_adapter, monkeypatch,
+):
+    from gateway.platforms import api_server_runs
+
+    session_id = "api_compact_task"
+    db = auth_adapter._ensure_session_db()
+    db.create_session(session_id, source="api_server")
+    closed: list[bool] = []
+    agent = SimpleNamespace(
+        session_id=session_id,
+        _end_session_on_close=True,
+        close=lambda: closed.append(True),
+        interrupt=lambda: None,
+    )
+    auth_adapter._create_agent = lambda **_kwargs: agent
+    result = {
+        "outcome": "compacted",
+        "source_session_id": session_id,
+        "result_session_id": session_id,
+        "before_tokens": 1000,
+        "after_tokens": 200,
+        "before_messages": 12,
+        "after_messages": 4,
+        "in_place": True,
+    }
+    monkeypatch.setattr(api_server_runs, "_compact_session_sync", lambda *_args: result)
+    app = _create_runs_app(auth_adapter)
+    async with TestClient(TestServer(app)) as client:
+        admitted = await client.post(
+            "/v1/runs/context-compactions",
+            json={"session_id": session_id},
+            headers={"Authorization": "Bearer sk-secret", "Idempotency-Key": "compact-task"},
+        )
+        assert admitted.status == 202
+        run_id = (await admitted.json())["run_id"]
+        payload: dict = {}
+        for _ in range(50):
+            response = await client.get(
+                f"/v1/runs/{run_id}", headers={"Authorization": "Bearer sk-secret"})
+            payload = await response.json()
+            if payload["status"] == "completed":
+                break
+            await asyncio.sleep(0.01)
+        assert payload["kind"] == "context_compaction"
+        assert payload["result"] == result
+    assert closed == [True]
+    assert agent._end_session_on_close is False
+
+
+def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_failure(monkeypatch):
+    from agent import conversation_compression, model_metadata, turn_facade_lease
+
+    events: list[str] = []
+
+    class FakeDb:
+        def __init__(self):
+            self.reads = 0
+
+        def try_acquire_session_turn_lease(self, *args, **kwargs):
+            events.append("acquire")
+            return True
+
+        def resolve_resume_session_id(self, session_id):
+            events.append("resolve")
+            return session_id
+
+        def get_messages_as_conversation(self, *args, **kwargs):
+            events.append("read")
+            self.reads += 1
+            count = 4 if self.reads == 1 else 2
+            return [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+                    for i in range(count)]
+
+    class FakeLease:
+        def __init__(self, *args):
+            pass
+
+        def build_threads(self):
+            events.append("build")
+
+        def start(self):
+            events.append("start")
+
+        def stop_refresher(self):
+            events.append("stop")
+
+        def join_threads(self):
+            events.append("join")
+
+        def release(self):
+            events.append("release")
+
+        def clear_interrupt(self):
+            events.append("clear")
+
+    class FakeCompressor:
+        def has_content_to_compress(self, messages):
+            return True
+
+    monkeypatch.setattr(turn_facade_lease, "DurableTurnLease", FakeLease)
+    monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", lambda messages, **kwargs: len(messages) * 10)
+    monkeypatch.setattr(
+        conversation_compression, "finalize_context_engine_compression_notification",
+        lambda agent, committed: events.append(f"notify:{committed}"))
+    run = SimpleNamespace(run_id="run_lease", session_id="api_compact")
+
+    def make_agent(fail=False):
+        db = FakeDb()
+        agent = SimpleNamespace(
+            _session_db=db, session_id="api_compact", _cached_system_prompt="", tools=[],
+            context_compressor=FakeCompressor(), _last_compaction_in_place=False)
+
+        def compress(*args, **kwargs):
+            events.append("compress")
+            if fail:
+                raise RuntimeError("boom")
+            agent._last_compaction_in_place = True
+            return ([{"role": "user", "content": "summary"},
+                     {"role": "assistant", "content": "kept"}], None)
+
+        agent._compress_context = compress
+        return agent
+
+    result = _compact_session_sync(None, cast(Any, run), make_agent())
+    assert result["outcome"] == "compacted"
+    assert events.index("acquire") < events.index("read") < events.index("compress")
+    assert events[-4:] == ["stop", "join", "release", "clear"]
+
+    events.clear()
+    with pytest.raises(RuntimeError, match="boom"):
+        _compact_session_sync(None, cast(Any, run), make_agent(fail=True))
+    assert events.index("acquire") < events.index("read") < events.index("compress")
+    assert events[-4:] == ["stop", "join", "release", "clear"]
+
+
 def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     """Create an aiohttp app with /v1/runs routes registered."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_post("/v1/runs/context-compactions", adapter._handle_context_compaction_runs)
     app.router.add_post(
         "/v1/room-members/invitations",
         adapter._handle_room_member_invitation,

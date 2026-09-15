@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from contextlib import suppress
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -101,6 +102,7 @@ def _initialize_run_state(self, *, store_factory) -> None:
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
         ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        ("POST", "/v1/runs/context-compactions", self._handle_context_compaction_runs),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
@@ -501,6 +503,221 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
     return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+
+
+class _CompactionBusy(RuntimeError):
+    """The session or compressor is already owned by another operation."""
+
+
+def _compact_session_sync(self, run: _RunLaunch, agent) -> dict[str, Any]:
+    """Compress one durable session under its cross-process turn lease."""
+    from agent.conversation_compression import finalize_context_engine_compression_notification
+    from agent.model_metadata import estimate_request_tokens_rough
+    from agent.turn_facade_lease import DurableTurnLease, LEASE_TTL_SECONDS
+
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        raise RuntimeError("session database unavailable")
+    holder = f"pid={os.getpid()}:turn={run.run_id}:platform=api_server_compaction"
+    if not db.try_acquire_session_turn_lease(
+        run.session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, patience_s=0.5
+    ):
+        raise _CompactionBusy("session is active; retry after the current run finishes")
+    lease = DurableTurnLease(agent, db, run.session_id, holder)
+    agent._active_session_turn_lease_holder = holder
+    agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+    committed = False
+    try:
+        lease.build_threads()
+        lease.start()
+        resolved_id = db.resolve_resume_session_id(run.session_id) or run.session_id
+        agent.session_id = resolved_id
+        messages = db.get_messages_as_conversation(
+            resolved_id, repair_alternation=True, include_row_ids=True)
+        messages = [m for m in messages if m.get("role") in {"user", "assistant", "tool"}]
+        system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+        tools = getattr(agent, "tools", None) or None
+        before_tokens = estimate_request_tokens_rough(
+            messages, system_prompt=system_prompt, tools=tools)
+        base = {
+            "source_session_id": run.session_id,
+            "result_session_id": resolved_id,
+            "before_tokens": before_tokens,
+            "before_messages": len(messages),
+        }
+        compressor = agent.context_compressor
+        if len(messages) < 4 or not compressor.has_content_to_compress(messages):
+            return {
+                **base, "outcome": "not_needed", "after_tokens": before_tokens,
+                "after_messages": len(messages),
+            }
+        compressed, _ = agent._compress_context(
+            messages, "", approx_tokens=before_tokens, force=True,
+            defer_context_engine_notification=True)
+        lock_skip = getattr(agent, "_compression_skipped_due_to_lock", None)
+        if lock_skip is True or isinstance(lock_skip, str):
+            raise _CompactionBusy("context compression is already in progress")
+        result_id = getattr(agent, "session_id", None) or resolved_id
+        if result_id == resolved_id and not getattr(agent, "_last_compaction_in_place", False):
+            raise RuntimeError("compression did not commit; transcript remains unchanged")
+        durable_messages = db.get_messages_as_conversation(
+            result_id, repair_alternation=True, include_row_ids=True)
+        if not durable_messages:
+            raise RuntimeError("compressed transcript was not durably readable")
+        finalize_context_engine_compression_notification(agent, committed=True)
+        committed = True
+        after_tokens = estimate_request_tokens_rough(
+            compressed, system_prompt=system_prompt, tools=tools)
+        return {
+            **base, "outcome": "compacted", "result_session_id": result_id,
+            "after_tokens": after_tokens, "after_messages": len(durable_messages),
+        }
+    finally:
+        if not committed:
+            with suppress(Exception):
+                finalize_context_engine_compression_notification(agent, committed=False)
+        lease.stop_refresher()
+        lease.join_threads()
+        lease.release()
+        lease.clear_interrupt()
+
+
+async def _execute_context_compaction(self, run: _RunLaunch, *, _api_server) -> None:
+    """Background task for one idempotent manual context-compaction run."""
+    loop = asyncio.get_running_loop()
+    terminal = False
+
+    def _finish(status: str, **extra: Any) -> None:
+        nonlocal terminal
+        if terminal:
+            return
+        terminal = True
+        current = self._run_statuses.get(run.run_id, {})
+        compaction = current.get("compaction")
+        if isinstance(compaction, dict) and compaction.get("state") == "running":
+            aborted = {**compaction, "state": "aborted", "updated_at": time.time()}
+            self._set_run_status(run.run_id, status, kind="context_compaction", compaction=aborted, **extra)
+            run.put_event(_run_event(run.run_id, "context.compaction.aborted", state="aborted"))
+        else:
+            self._set_run_status(run.run_id, status, kind="context_compaction", **extra)
+        event_extra = dict(extra)
+        if status == "completed":
+            event_extra.update(output="", pending_steer=None, usage=None)
+        run.put_event(_run_event(run.run_id, f"run.{status}", **event_extra))
+
+    agent = None
+    try:
+        status_callback, event_callback = _make_run_compaction_callbacks(self, run, loop)
+        with self._profile_scope(run.request_profile):
+            agent = self._create_agent(
+                session_id=run.session_id, status_callback=status_callback,
+                event_callback=event_callback)
+            agent._end_session_on_close = False
+            context = copy_context()
+        self._active_run_agents[run.run_id] = agent
+        status_callback("compacting", "🗜️ Compacting context...")
+        result = await loop.run_in_executor(
+            None, context.run, lambda: _compact_session_sync(self, run, agent))
+        if run.run_id in self._stopping_run_ids:
+            _finish("cancelled")
+            return
+        current = self._run_statuses.get(run.run_id, {})
+        state = (current.get("compaction") or {}).get("state")
+        if state != "completed":
+            event_callback("session:compress", result)
+        _finish("completed", result=result)
+    except asyncio.CancelledError:
+        _finish("cancelled")
+        raise
+    except _CompactionBusy as exc:
+        _finish("failed", error=str(exc), error_code="session_busy")
+    except Exception as exc:
+        logger.exception("[api_server] context compaction %s failed", run.run_id)
+        _finish(
+            "failed", error=_api_server._redact_api_error_text(exc), error_code="context_compaction_failed")
+    finally:
+        if agent is not None:
+            with suppress(Exception):
+                close = getattr(agent, "close", None)
+                if callable(close):
+                    await loop.run_in_executor(None, close)
+        with suppress(Exception):
+            run.put_event(None)
+        _retire_live_run(self, run.run_id)
+
+
+async def _handle_context_compaction_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """POST /v1/runs/context-compactions — start a durable manual compaction operation."""
+    auth_error = self._check_auth(request)
+    if auth_error is not None:
+        return auth_error
+    body, error = await self._read_json_body(request)
+    if error is not None:
+        return error
+    unknown = sorted(set(body) - {"session_id"})
+    if unknown:
+        return _json_error(
+            _api_server._openai_error, f"Unsupported fields: {', '.join(unknown)}",
+            code="unsupported_field", status=400)
+    session_id = body.get("session_id")
+    if not isinstance(session_id, str) or not session_id or session_id != session_id.strip():
+        return _json_error(
+            _api_server._openai_error, "session_id must be a non-empty exact string",
+            code="invalid_session_id", status=400)
+    _, session_error = await self._get_existing_session_or_404(session_id)
+    if session_error is not None:
+        return session_error
+    idempotency_key = request.headers.get("Idempotency-Key", "")
+    if not idempotency_key or len(idempotency_key) > 255 or any(
+        ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key
+    ):
+        return _json_error(
+            _api_server._openai_error,
+            "Idempotency-Key must be 1-255 visible ASCII characters",
+            code="invalid_idempotency_key", status=400)
+    scope = self._run_idempotency_scope(request)
+    fingerprint = hashlib.sha256(json.dumps(
+        {"kind": "context_compaction", "session_id": session_id},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    outcome, record = self._run_idempotency_store.lookup(
+        scope, idempotency_key, fingerprint, retention_until=_room_retention_until(request))
+    if outcome == "conflict" or (outcome == "reused" and record is not None):
+        return _replay_or_conflict(
+            self, request, outcome, record, None, _api_server._openai_error)
+    limited = self._concurrency_limited_response()
+    if limited is not None:
+        return limited
+    run_id = f"run_{uuid.uuid4().hex}"
+    self._run_owners[run_id] = scope
+    queue = self._run_streams[run_id] = asyncio.Queue()
+    created_at = self._run_streams_created[run_id] = time.time()
+    initial_status = self._set_run_status(
+        run_id, "queued", created_at=created_at, session_id=session_id,
+        kind="context_compaction", model=None, compaction=None)
+    outcome, record = self._run_idempotency_store.reserve(
+        scope, idempotency_key, fingerprint, run_id, initial_status,
+        owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
+        retention_until=_room_retention_until(request))
+    if outcome != "created":
+        _forget_run(
+            self, run_id, self._run_streams, self._run_streams_created,
+            self._run_statuses, self._run_owners)
+        return _replay_or_conflict(
+            self, request, outcome, record, None, _api_server._openai_error)
+    self._run_idempotency_ids.add(run_id)
+    launch = _RunLaunch(
+        self, run_id, queue, session_id, None, False, "", [], {},
+        request_profile=_api_server._api_request_profile.get(),
+        browser_control_principal=_api_server._api_request_browser_control_principal.get(),
+        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
+    self._activate_admitted_request()
+    task = self._active_run_tasks[run_id] = asyncio.create_task(
+        _execute_context_compaction(self, launch, _api_server=_api_server))
+    with suppress(TypeError):
+        self._background_tasks.add(task)
+    if hasattr(task, "add_done_callback"):
+        task.add_done_callback(self._background_tasks.discard)
+    return _accepted_response(run_id, "started", None, replayed=False)
 
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):

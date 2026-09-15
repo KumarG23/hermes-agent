@@ -67,6 +67,7 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
     assert features["session_fork_preserves_source"] is True
+    assert features["session_compaction_runs"] is True
     assert features["run_steer"] is True
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False

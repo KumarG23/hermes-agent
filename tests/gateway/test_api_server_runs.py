@@ -255,6 +255,9 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
             events.append("clear")
 
     class FakeCompressor:
+        def __init__(self):
+            self._last_compression_telemetry: dict[str, str] | None = None
+
         def has_content_to_compress(self, messages):
             return True
 
@@ -265,16 +268,20 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
         lambda agent, committed: events.append(f"notify:{committed}"))
     run = SimpleNamespace(run_id="run_lease", session_id="api_compact")
 
-    def make_agent(fail=False):
+    def make_agent(fail=False, no_progress=False):
         db = FakeDb()
+        compressor = FakeCompressor()
         agent = SimpleNamespace(
             _session_db=db, session_id="api_compact", _cached_system_prompt="", tools=[],
-            context_compressor=FakeCompressor(), _last_compaction_in_place=False)
+            context_compressor=compressor, _last_compaction_in_place=False)
 
         def compress(*args, **kwargs):
             events.append("compress")
             if fail:
                 raise RuntimeError("boom")
+            if no_progress:
+                compressor._last_compression_telemetry = {"failure_class": "no_progress"}
+                return (args[0], None)
             agent._last_compaction_in_place = True
             return ([{"role": "user", "content": "summary"},
                      {"role": "assistant", "content": "kept"}], None)
@@ -284,7 +291,15 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
 
     result = _compact_session_sync(None, cast(Any, run), make_agent())
     assert result["outcome"] == "compacted"
+    assert result["in_place"] is True
     assert events.index("acquire") < events.index("read") < events.index("compress")
+    assert events[-4:] == ["stop", "join", "release", "clear"]
+
+    events.clear()
+    result = _compact_session_sync(None, cast(Any, run), make_agent(no_progress=True))
+    assert result["outcome"] == "not_needed"
+    assert result["in_place"] is False
+    assert result["before_messages"] == result["after_messages"] == 4
     assert events[-4:] == ["stop", "join", "release", "clear"]
 
     events.clear()

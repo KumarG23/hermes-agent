@@ -549,7 +549,7 @@ def _compact_session_sync(self, run: _RunLaunch, agent) -> dict[str, Any]:
         if len(messages) < 4 or not compressor.has_content_to_compress(messages):
             return {
                 **base, "outcome": "not_needed", "after_tokens": before_tokens,
-                "after_messages": len(messages),
+                "after_messages": len(messages), "in_place": False,
             }
         compressed, _ = agent._compress_context(
             messages, "", approx_tokens=before_tokens, force=True,
@@ -559,6 +559,12 @@ def _compact_session_sync(self, run: _RunLaunch, agent) -> dict[str, Any]:
             raise _CompactionBusy("context compression is already in progress")
         result_id = getattr(agent, "session_id", None) or resolved_id
         if result_id == resolved_id and not getattr(agent, "_last_compaction_in_place", False):
+            telemetry = getattr(compressor, "_last_compression_telemetry", None)
+            if isinstance(telemetry, dict) and telemetry.get("failure_class") == "no_progress":
+                return {
+                    **base, "outcome": "not_needed", "result_session_id": result_id,
+                    "after_tokens": before_tokens, "after_messages": len(messages), "in_place": False,
+                }
             raise RuntimeError("compression did not commit; transcript remains unchanged")
         durable_messages = db.get_messages_as_conversation(
             result_id, repair_alternation=True, include_row_ids=True)
@@ -571,6 +577,7 @@ def _compact_session_sync(self, run: _RunLaunch, agent) -> dict[str, Any]:
         return {
             **base, "outcome": "compacted", "result_session_id": result_id,
             "after_tokens": after_tokens, "after_messages": len(durable_messages),
+            "in_place": result_id == resolved_id,
         }
     finally:
         if not committed:

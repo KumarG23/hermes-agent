@@ -1,6 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
 import asyncio
+import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -102,6 +103,9 @@ async def test_fork_copies_history_without_ending_or_mutating_source(adapter, se
         )
         assert resp.status == 201
         payload = await resp.json()
+        source_history = await cli.get(f"/api/sessions/{source_id}/messages?limit=10&offset=0")
+        assert source_history.status == 200
+        assert (await source_history.json())["session_id"] == source_id
 
     source = session_db.get_session(source_id)
     child = session_db.get_session("fork-child")
@@ -109,6 +113,11 @@ async def test_fork_copies_history_without_ending_or_mutating_source(adapter, se
     assert source["ended_at"] is None
     assert source["end_reason"] is None
     assert child["parent_session_id"] == source_id
+    assert session_db.resolve_resume_session_id(source_id) == source_id
+    child_model_config = child["model_config"]
+    if isinstance(child_model_config, str):
+        child_model_config = json.loads(child_model_config)
+    assert child_model_config["_branched_from"] == source_id
     source_after = session_db.get_messages(source_id)
     child_messages = session_db.get_messages("fork-child")
     assert source_after == source_before

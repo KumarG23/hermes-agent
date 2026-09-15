@@ -2967,7 +2967,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # switches away from its source, but a browser-side Fork must never mutate another open view.
         await asyncio.to_thread(
             db.create_session, fork_id, "api_server", model=source.get("model"),
-            system_prompt=source.get("system_prompt"), parent_session_id=source_id)
+            model_config={"_branched_from": source_id}, system_prompt=source.get("system_prompt"),
+            parent_session_id=source_id)
         messages = await asyncio.to_thread(db.get_messages, source_id)
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
         title = body.get("title")

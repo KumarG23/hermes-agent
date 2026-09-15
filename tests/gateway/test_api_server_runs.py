@@ -255,6 +255,11 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
             events.append("clear")
 
     class FakeCompressor:
+        def __init__(self):
+            self._last_compression_made_progress = True
+            self._last_summary_error: str | None = None
+            self._last_feasibility_skip = False
+
         def has_content_to_compress(self, messages):
             return True
 
@@ -265,20 +270,23 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
         lambda agent, committed: events.append(f"notify:{committed}"))
     run = SimpleNamespace(run_id="run_lease", session_id="api_compact")
 
-    def make_agent(fail=False, no_progress=False):
+    def make_agent(fail=False, no_progress=False, marked_failure=False):
         db = FakeDb()
         compressor = FakeCompressor()
         agent = SimpleNamespace(
             _session_db=db, session_id="api_compact", _cached_system_prompt="", tools=[],
-            context_compressor=compressor, _last_compaction_in_place=False,
-            _last_compression_telemetry=None)
+            context_compressor=compressor, _last_compaction_in_place=False)
 
         def compress(*args, **kwargs):
             events.append("compress")
             if fail:
                 raise RuntimeError("boom")
             if no_progress:
-                agent._last_compression_telemetry = {"failure_class": "no_progress"}
+                compressor._last_compression_made_progress = False
+                return (args[0], None)
+            if marked_failure:
+                compressor._last_compression_made_progress = False
+                compressor._last_summary_error = "provider failed"
                 return (args[0], None)
             agent._last_compaction_in_place = True
             return ([{"role": "user", "content": "summary"},
@@ -298,6 +306,11 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
     assert result["outcome"] == "not_needed"
     assert result["in_place"] is False
     assert result["before_messages"] == result["after_messages"] == 4
+    assert events[-4:] == ["stop", "join", "release", "clear"]
+
+    events.clear()
+    with pytest.raises(RuntimeError, match="compression did not commit"):
+        _compact_session_sync(None, cast(Any, run), make_agent(marked_failure=True))
     assert events[-4:] == ["stop", "join", "release", "clear"]
 
     events.clear()

@@ -559,8 +559,10 @@ def _compact_session_sync(self, run: _RunLaunch, agent) -> dict[str, Any]:
             raise _CompactionBusy("context compression is already in progress")
         result_id = getattr(agent, "session_id", None) or resolved_id
         if result_id == resolved_id and not getattr(agent, "_last_compaction_in_place", False):
-            telemetry = getattr(agent, "_last_compression_telemetry", None)
-            if isinstance(telemetry, dict) and telemetry.get("failure_class") == "no_progress":
+            made_progress = getattr(compressor, "_last_compression_made_progress", None)
+            summary_error = getattr(compressor, "_last_summary_error", None)
+            feasibility_skip = bool(getattr(compressor, "_last_feasibility_skip", False))
+            if made_progress is False and not summary_error and not feasibility_skip:
                 return {
                     **base, "outcome": "not_needed", "result_session_id": result_id,
                     "after_tokens": before_tokens, "after_messages": len(messages), "in_place": False,

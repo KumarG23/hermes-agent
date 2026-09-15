@@ -255,9 +255,6 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
             events.append("clear")
 
     class FakeCompressor:
-        def __init__(self):
-            self._last_compression_telemetry: dict[str, str] | None = None
-
         def has_content_to_compress(self, messages):
             return True
 
@@ -273,14 +270,15 @@ def test_context_compaction_reads_only_under_lease_and_releases_on_success_and_f
         compressor = FakeCompressor()
         agent = SimpleNamespace(
             _session_db=db, session_id="api_compact", _cached_system_prompt="", tools=[],
-            context_compressor=compressor, _last_compaction_in_place=False)
+            context_compressor=compressor, _last_compaction_in_place=False,
+            _last_compression_telemetry=None)
 
         def compress(*args, **kwargs):
             events.append("compress")
             if fail:
                 raise RuntimeError("boom")
             if no_progress:
-                compressor._last_compression_telemetry = {"failure_class": "no_progress"}
+                agent._last_compression_telemetry = {"failure_class": "no_progress"}
                 return (args[0], None)
             agent._last_compaction_in_place = True
             return ([{"role": "user", "content": "summary"},

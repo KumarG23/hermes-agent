@@ -559,7 +559,7 @@ def _compact_session_sync(self, run: _RunLaunch, agent) -> dict[str, Any]:
             raise _CompactionBusy("context compression is already in progress")
         result_id = getattr(agent, "session_id", None) or resolved_id
         if result_id == resolved_id and not getattr(agent, "_last_compaction_in_place", False):
-            telemetry = getattr(compressor, "_last_compression_telemetry", None)
+            telemetry = getattr(agent, "_last_compression_telemetry", None)
             if isinstance(telemetry, dict) and telemetry.get("failure_class") == "no_progress":
                 return {
                     **base, "outcome": "not_needed", "result_session_id": result_id,

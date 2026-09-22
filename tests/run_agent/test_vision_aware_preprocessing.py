@@ -55,7 +55,8 @@ class TestPrepareAnthropicMessages:
     def test_vision_capable_passes_images_through(self):
         """The Anthropic adapter handles image_url/input_image natively."""
         agent = _make_agent()
-        with patch.object(agent, "_model_supports_vision", return_value=True):
+        with patch.object(agent, "_model_supports_vision", return_value=True), \
+             patch("hermes_cli.config.load_config", return_value={"agent": {"image_input_mode": "native"}}):
             out = agent._prepare_anthropic_messages_for_api([IMG_PARTS_USER_MSG])
         # Passes through unchanged — image_url parts still present.
         assert out[0]["content"][1]["type"] == "image_url"
@@ -93,9 +94,30 @@ class TestPrepareMessagesForNonVision:
         agent = _make_agent()
         agent.provider = "openrouter"
         agent.model = "anthropic/claude-sonnet-4"
-        with patch.object(agent, "_model_supports_vision", return_value=True):
+        with patch.object(agent, "_model_supports_vision", return_value=True), \
+             patch("hermes_cli.config.load_config", return_value={"agent": {"image_input_mode": "native"}}):
             out = agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
         assert out[0]["content"][1]["type"] == "image_url"
+
+    def test_explicit_auxiliary_vision_routes_raw_api_images_through_text_description(self):
+        agent = _make_agent()
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.6-sol"
+        config = {
+            "agent": {"image_input_mode": "auto"},
+            "auxiliary": {"vision": {"provider": "xai-oauth", "model": "grok-4.6"}},
+        }
+        with patch.object(agent, "_model_supports_vision", return_value=True), \
+             patch("hermes_cli.config.load_config", return_value=config), \
+             patch.object(
+                 agent,
+                 "_describe_image_for_anthropic_fallback",
+                 return_value="[Image description: a red square]",
+             ):
+            out = agent._prepare_messages_for_non_vision_model([IMG_PARTS_USER_MSG])
+        assert isinstance(out[0]["content"], str)
+        assert "a red square" in out[0]["content"]
+        assert "image_url" not in out[0]["content"]
 
     def test_non_vision_strips_images(self):
         agent = _make_agent()

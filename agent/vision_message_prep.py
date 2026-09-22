@@ -97,9 +97,11 @@ class VisionMessagePrepMixin:
 
         role_label = {"assistant": "assistant", "tool": "tool result"}.get(role, "user")
         analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, UI, data, objects, people, layout, colors, "
-            "and any other notable visual information."
+            "Analyze only what is actually visible in this image. Start with the dominant colors and "
+            "whether the image is blank, solid/simple, a photograph, an illustration, or a UI/code screenshot. "
+            "Then describe any text, code, UI, data, objects, people, layout, and other notable details. "
+            "Do not infer or invent text or objects that are not visibly present; if the image is a single "
+            "color or otherwise minimal, say that plainly."
         )
 
         vision_source = str(image_url or "")
@@ -185,11 +187,28 @@ class VisionMessagePrepMixin:
         return cache[mode]
 
     def _prepare_messages_for_non_vision_model(self, api_messages: list) -> list:
-        """Replace native image parts with cached vision_analyze text when the active model lacks vision;
-        vision-capable models pass through unchanged (the provider adapter handles image parts natively)."""
+        """Route image parts through the configured input mode.
+
+        ``native`` leaves pixels for the provider adapter. ``text`` runs the configured
+        auxiliary vision path even when the main model advertises vision support; this
+        keeps raw API/Responses multipart turns aligned with gateway/CLI image routing.
+        """
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content")) for msg in api_messages
-        ) or self._model_supports_vision():
+        ):
+            return api_messages
+        try:
+            from hermes_cli.config import load_config
+            from agent.image_routing import decide_image_input_mode
+            mode = decide_image_input_mode(
+                (getattr(self, "provider", "") or "").strip(),
+                (getattr(self, "model", "") or "").strip(),
+                load_config(),
+                requested_provider=(getattr(self, "requested_provider", "") or "").strip(),
+            )
+        except Exception:
+            mode = "native" if self._model_supports_vision() else "text"
+        if mode == "native":
             return api_messages
 
         transformed = copy.deepcopy(api_messages)

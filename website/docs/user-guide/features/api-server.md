@@ -462,6 +462,61 @@ Poll the current run state. This is useful for dashboards that need status witho
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
 
+#### Exact persisted message binding (version 1)
+
+New runs with an explicit string `session_id` and string `input` can include
+this optional field on the existing authenticated run-status response:
+
+```json
+{
+  "history_binding": {
+    "version": 1,
+    "user_message_id": 41,
+    "assistant_message_id": 44
+  }
+}
+```
+
+Both IDs are the native integer `id` values returned by
+`GET /api/sessions/{session_id}/messages` for that response's `session_id`.
+There is no prefix, offset, UUID conversion or text matching. Clients that
+represent IDs as strings must use the same lossless decimal conversion for
+history and bindings, after validating the integer range they support.
+
+The agent captures the actual new user object and the finalizer's completed
+assistant object. The existing batch writer's inserted IDs are retained only
+after commit. Successful Runs API completion atomically records the run ID
+on those two existing message rows. Content comparisons and stored hashes
+only invalidate changed rows; they never locate or select messages.
+
+Bindings are absent for legacy runs, missing or ambiguous identities,
+unsupported input forms, failed/interrupted/cancelled/incomplete turns,
+uncommitted rows, tool-call tails, transformed output, and compression or
+rewrite paths that cannot preserve the exact pair. A failed transcript or
+binding commit cannot advertise a successful bound run. Every status read
+revalidates both rows; retiring or changing either row makes the binding
+unavailable. Copies made by fork/import/replace do not inherit the binding.
+No historical associations are backfilled.
+
+After API/agent recreation, a committed, still-valid pair can recover a
+minimal `completed` status with `recovered: true`, `run_id`, `session_id`,
+`output`, and `history_binding`. Usage, model/route receipts, timestamps,
+events and active-run recovery are not reconstructed. Incomplete or legacy
+runs may return 404 after in-memory status expires. Reads never start or
+replay work. This is a completed-message identity contract, not durable run
+execution or durable admission/idempotency. In particular, do not re-POST
+`/v1/runs` after a lost acknowledgement: this change adds no POST deduplication
+or recovery by client request key. Keep the original run ID and poll it.
+
+Storage stays in the selected profile's existing SessionDB; nullable message
+columns are added by its existing schema reconciler. No new HTTP endpoint,
+authentication, provider control, transcript store or background worker is added.
+The small completion confirmation uses the existing synchronous transcript
+write policy without an await between the durable association and terminal
+status publication, so cancellation cannot split that boundary. It can wait
+for SQLite's existing transcript write patience under contention.
+
+
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.

@@ -1560,6 +1560,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        self._run_binding_homes: Dict[str, str] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -7656,6 +7657,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        # Scope binding evidence to this profile's existing SessionDB. Capture
+        # no credentials and make no changes to authentication/routing.
+        from hermes_constants import get_hermes_home
+
+        binding_home = str(get_hermes_home())
+        binding_supported = isinstance(body.get("session_id"), str) and isinstance(raw_input, str)
+        self._run_binding_homes[run_id] = binding_home
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -7739,6 +7747,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                     )
+                if binding_supported:
+                    agent._run_binding_rows = {}
+                    agent._run_binding_user = None
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -7876,11 +7887,28 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.failed",
                     )
                 else:
+                    if binding_supported and getattr(agent, "_run_binding_persistence_failed", False):
+                        raise RuntimeError("Run transcript could not be committed")
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
                     pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                    # Confirm completion only after the exact transcript pair
+                    # and its immutable run association have committed. No await
+                    # splits this small write from the terminal status update.
+                    pair = result.get("_persisted_message_pair") if isinstance(result, dict) else None
+                    if binding_supported and pair is not None:
+                        from hermes_state import SessionDB
+
+                        db = getattr(agent, "_session_db", None)
+                        if (not isinstance(db, SessionDB)
+                                or getattr(agent, "session_id", None) != session_id
+                                or not db.bind_run_messages(
+                                    run_id, session_id, *pair,
+                                    expected_user=user_message, expected_answer=final_response,
+                                )):
+                            raise RuntimeError("Run message binding could not be committed")
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
@@ -8005,12 +8033,35 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        # Resolve only explicit bindings in the URL-selected profile store.
+        # Revalidate on every poll so rewind/rewrite cannot leave stale targets.
+        from hermes_constants import get_hermes_home
+
+        binding = None
+        same_home = self._run_binding_homes.get(run_id) == str(get_hermes_home())
+        if status is None or (same_home and status.get("status") == "completed"):
+            db = await self._ensure_session_db_async()
+            if db is not None:
+                try:
+                    binding = await asyncio.to_thread(db.get_run_message_binding, run_id)
+                except Exception:
+                    logger.warning("Run message binding read unavailable")
+        if status is None and binding is not None:
+            # Terminal projection only: never replay/admit work or fabricate
+            # usage, routes, events or recovery of an interrupted run.
+            status = {"object": "hermes.run", "run_id": run_id,
+                      "status": "completed", "session_id": binding["session_id"],
+                      "output": binding["output"], "recovered": True}
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        return web.json_response(status)
+        projected = dict(status)
+        projected.pop("history_binding", None)
+        if binding is not None and binding["session_id"] == status.get("session_id"):
+            projected["history_binding"] = binding["history_binding"]
+        return web.json_response(projected)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -8291,6 +8342,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_binding_homes.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

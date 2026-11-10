@@ -688,6 +688,9 @@ def build_turn_context(
             user_msg["display_metadata"] = persist_user_display_metadata
 
     append_message(messages, user_msg)
+    if hasattr(agent, "_run_binding_rows"):
+        # Keep the actual newly-created user object, never a text/index join.
+        agent._run_binding_user = user_msg
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 

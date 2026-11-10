@@ -2403,6 +2403,13 @@ class AIAgent:
                 )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
+                # _insert_message_rows supplies exact ids; only retain them
+                # AFTER append_messages_batch has successfully committed.
+                if hasattr(self, "_run_binding_rows"):
+                    for live, row in zip(_batch_msgs, _batch_rows):
+                        self._run_binding_rows[id(live)] = (
+                            live, self.session_id, row.get("_row_id")
+                        )
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -2411,11 +2418,15 @@ class AIAgent:
             # Snapshot for the bounded scan above — only on full success, so
             # a partially-processed list can never be treated as settled.
             self._db_flush_scan_prefix = messages[:]
+            if hasattr(self, "_run_binding_rows"):
+                self._run_binding_persistence_failed = False
             return True
         except Exception as e:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            if hasattr(self, "_run_binding_rows"):
+                self._run_binding_persistence_failed = True
             # This is the one place the underlying SQLite error is visible
             # before it is swallowed into a bare ``False`` — classify it here
             # so the turn-end explanation can distinguish lock contention

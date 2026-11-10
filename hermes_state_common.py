@@ -433,7 +433,9 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     display_kind TEXT,
-    display_metadata TEXT
+    display_metadata TEXT,
+    api_run_id TEXT,
+    api_run_content_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -539,6 +541,8 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 # existing databases. SCHEMA_SQL above is run by sqlite executescript
 # which would otherwise fail on legacy DBs ("no such column: active").
 DEFERRED_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_messages_api_run ON messages(api_run_id)
+    WHERE api_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_active_null

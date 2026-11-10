@@ -10095,6 +10095,105 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    @staticmethod
+    def _validated_run_pair(rows):
+        if len(rows) != 2:
+            return None
+        by_role = {row["role"]: row for row in rows}
+        if set(by_role) != {"user", "assistant"}:
+            return None
+        user, answer = by_role["user"], by_role["assistant"]
+        if (user["session_id"] != answer["session_id"]
+                or any(row["active"] != 1 or row["display_kind"] == "hidden"
+                       or row["tool_calls"] or row["tool_call_id"] for row in rows)):
+            return None
+        if not all(isinstance(row["content"], str) for row in rows) or not answer["content"]:
+            return None
+        return user, answer
+
+    @staticmethod
+    def _run_message_content_hash(row):
+        # Invalidation guard only, never a lookup/join by answer text.
+        return hashlib.sha256(row["content"].encode("utf-8")).hexdigest()
+
+    def bind_run_messages(
+        self, run_id, session_id, user_id, assistant_id, *,
+        expected_user=None, expected_answer=None, commit_guard=None,
+    ):
+        """Commit an immutable completed-run pair on the two canonical rows.
+
+        Called only by the successful /v1/runs completion boundary. Never
+        copies a binding during replace/fork/import. Rewinds/compression that
+        retire either row make the binding unavailable on subsequent reads.
+        """
+        if (not isinstance(run_id, str) or not re.fullmatch(r"run_[A-Za-z0-9_]+", run_id)
+                or len(run_id) > 160 or not session_id
+                or type(user_id) is not int or type(assistant_id) is not int
+                or user_id <= 0 or assistant_id <= 0 or user_id == assistant_id):
+            return False
+
+        def _do(conn):
+            # The Runs API cancels while SQLite is contended, or atomically
+            # claims completion here. The completion gate holds no lock over I/O.
+            if commit_guard is not None and not commit_guard():
+                return False
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE id IN (?, ?)",
+                (user_id, assistant_id),
+            ).fetchall()
+            pair = self._validated_run_pair(rows)
+            if (pair is None or pair[0]["id"] != user_id
+                    or pair[1]["id"] != assistant_id
+                    or pair[0]["session_id"] != session_id):
+                return False
+            # Validate the already-identified rows against the completed turn;
+            # a concurrent rewrite after the agent released its turn lease
+            # must not attach a run to changed content. Never search by text.
+            if ((expected_user is not None and pair[0]["content"] != expected_user)
+                    or (expected_answer is not None and pair[1]["content"] != expected_answer)):
+                return False
+            existing = conn.execute(
+                "SELECT id FROM messages WHERE api_run_id = ?", (run_id,)
+            ).fetchall()
+            if existing:
+                return (
+                    {row["id"] for row in existing} == {user_id, assistant_id}
+                    and all(row["api_run_content_hash"] == self._run_message_content_hash(row)
+                            for row in rows)
+                )
+            if any(row["api_run_id"] is not None for row in rows):
+                return False
+            for row in rows:
+                conn.execute(
+                    "UPDATE messages SET api_run_id = ?, api_run_content_hash = ? WHERE id = ?",
+                    (run_id, self._run_message_content_hash(row), row["id"]),
+                )
+            return True
+
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def get_run_message_binding(self, run_id):
+        """Read only explicitly committed pairs from this profile's store."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE api_run_id = ? LIMIT 3", (run_id,)
+            ).fetchall()
+        pair = self._validated_run_pair(rows)
+        if pair is None or any(
+            row["api_run_content_hash"] != self._run_message_content_hash(row) for row in rows
+        ):
+            return None
+        user, answer = pair
+        return {
+            "session_id": user["session_id"],
+            "history_binding": {
+                "version": 1,
+                "user_message_id": user["id"],
+                "assistant_message_id": answer["id"],
+            },
+            "output": self._decode_content(answer["content"]),
+        }
+
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
         display_metadata: Optional[Dict[str, Any]] = None,

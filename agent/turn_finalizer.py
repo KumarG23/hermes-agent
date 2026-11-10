@@ -447,8 +447,13 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
+        # The finalizer owns this exact final object. Compaction may have
+        # replaced it; only an object with a committed identity can bind.
+        _binding_final = messages[-1] if messages else None
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
+        if hasattr(agent, "_run_binding_rows"):
+            agent._run_binding_persistence_failed = True
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
@@ -727,6 +732,12 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if hasattr(agent, "_run_binding_rows"):
+        from agent.run_message_binding import committed_pair
+
+        pair = committed_pair(agent, locals().get("_binding_final"), result)
+        if pair is not None:
+            result["_persisted_message_pair"] = pair
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

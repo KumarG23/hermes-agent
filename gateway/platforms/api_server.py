@@ -1560,6 +1560,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        self._run_binding_homes: Dict[str, str] = {}
+        # Thread-safe, process-local cancellation/commit arbitration only.
+        # The Future's lock is never held over SQLite I/O.
+        self._run_binding_completions: Dict[str, concurrent.futures.Future] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -7656,6 +7660,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         run_id = f"run_{uuid.uuid4().hex}"
+        # Scope binding evidence to this profile's existing SessionDB. Capture
+        # no credentials and make no changes to authentication/routing.
+        from hermes_constants import get_hermes_home
+
+        binding_home = str(get_hermes_home())
+        binding_supported = isinstance(body.get("session_id"), str) and isinstance(raw_input, str)
+        self._run_binding_homes[run_id] = binding_home
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -7739,6 +7750,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         model_options=agent_overrides.get("model_options"),
                         route=route,
                     )
+                if binding_supported:
+                    agent._run_binding_rows = {}
+                    agent._run_binding_user = None
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -7876,11 +7890,28 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.failed",
                     )
                 else:
+                    if binding_supported and getattr(agent, "_run_binding_persistence_failed", False):
+                        raise RuntimeError("Run transcript could not be committed")
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
                     pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                    # Confirm off-loop; the transaction arbitrates cancellation
+                    # before claiming completion. Once claimed, drain its real
+                    # outcome before publishing a terminal state.
+                    pair = result.get("_persisted_message_pair") if isinstance(result, dict) else None
+                    if binding_supported and pair is not None:
+                        from hermes_state import SessionDB
+
+                        db = getattr(agent, "_session_db", None)
+                        if (not isinstance(db, SessionDB)
+                                or getattr(agent, "session_id", None) != session_id):
+                            raise RuntimeError("Run message binding could not be committed")
+                        await self._confirm_run_message_binding(
+                            db, run_id, session_id, pair,
+                            expected_user=user_message, expected_answer=final_response,
+                        )
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
@@ -7976,6 +8007,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_binding_completions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -7997,6 +8029,47 @@ class APIServerAdapter(BasePlatformAdapter):
             headers=response_headers,
         )
 
+    async def _confirm_run_message_binding(
+        self, db, run_id, session_id, pair, *, expected_user, expected_answer,
+    ):
+        """Drain one off-loop commit; cancellation and commitment have one winner."""
+        completion = concurrent.futures.Future()
+        self._run_binding_completions[run_id] = completion
+
+        def claim_commit():
+            # Called inside BEGIN IMMEDIATE, after SQLite contention is over.
+            # A retry after a rolled-back attempt retains the completion claim.
+            if completion.cancelled():
+                return False
+            return completion.running() or completion.set_running_or_notify_cancel()
+
+        def write():
+            return db.bind_run_messages(
+                run_id, session_id, *pair,
+                expected_user=expected_user, expected_answer=expected_answer,
+                commit_guard=claim_commit,
+            )
+
+        write_future = asyncio.get_running_loop().run_in_executor(None, write)
+        while True:
+            try:
+                committed = await asyncio.shield(write_future)
+                break
+            except asyncio.CancelledError:
+                # Cancelling an asyncio wrapper does not stop its worker.
+                # Keep its refs until the actual transaction settles, including
+                # repeated cancellation. Never publish cancelled over a commit.
+                if completion.cancel():
+                    self._set_run_status(run_id, "stopping", last_event="run.stopping")
+            except Exception:
+                if completion.cancelled():
+                    raise asyncio.CancelledError() from None
+                raise
+        if completion.cancelled():
+            raise asyncio.CancelledError()
+        if not committed:
+            raise RuntimeError("Run message binding could not be committed")
+
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
         auth_err = self._check_auth(request)
@@ -8005,12 +8078,35 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
+        # Resolve only explicit bindings in the URL-selected profile store.
+        # Revalidate on every poll so rewind/rewrite cannot leave stale targets.
+        from hermes_constants import get_hermes_home
+
+        binding = None
+        same_home = self._run_binding_homes.get(run_id) == str(get_hermes_home())
+        if status is None or (same_home and status.get("status") == "completed"):
+            db = await self._ensure_session_db_async()
+            if db is not None:
+                try:
+                    binding = await asyncio.to_thread(db.get_run_message_binding, run_id)
+                except Exception:
+                    logger.warning("Run message binding read unavailable")
+        if status is None and binding is not None:
+            # Terminal projection only: never replay/admit work or fabricate
+            # usage, routes, events or recovery of an interrupted run.
+            status = {"object": "hermes.run", "run_id": run_id,
+                      "status": "completed", "session_id": binding["session_id"],
+                      "output": binding["output"], "recovered": True}
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        return web.json_response(status)
+        projected = dict(status)
+        projected.pop("history_binding", None)
+        if binding is not None and binding["session_id"] == status.get("session_id"):
+            projected["history_binding"] = binding["history_binding"]
+        return web.json_response(projected)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -8225,6 +8321,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
+        completion = self._run_binding_completions.get(run_id)
+        if completion is not None and not completion.cancel():
+            # The transaction already claimed completion. Its actual commit or
+            # failure wins; accepting stop here could contradict durable recovery.
+            return web.json_response(
+                _openai_error("Run completion is already committing", code="run_completing"),
+                status=409,
+            )
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
 
@@ -8291,6 +8395,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_binding_homes.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

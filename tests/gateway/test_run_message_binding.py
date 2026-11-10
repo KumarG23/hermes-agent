@@ -139,6 +139,7 @@ async def client_for(adapter):
     app = web.Application()
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     app.router.add_get(
         "/api/sessions/{session_id}/messages", adapter._handle_session_messages
     )

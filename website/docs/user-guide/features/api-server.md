@@ -511,10 +511,18 @@ or recovery by client request key. Keep the original run ID and poll it.
 Storage stays in the selected profile's existing SessionDB; nullable message
 columns are added by its existing schema reconciler. No new HTTP endpoint,
 authentication, provider control, transcript store or background worker is added.
-The small completion confirmation uses the existing synchronous transcript
-write policy without an await between the durable association and terminal
-status publication, so cancellation cannot split that boundary. It can wait
-for SQLite's existing transcript write patience under contention.
+Completion confirmation runs in the existing executor, so SQLite contention
+never blocks the API event loop. Existing transcript write patience is unchanged.
+A process-local Future arbitrates cancellation inside `BEGIN IMMEDIATE` after
+the write lock is acquired. Stop or task cancellation before that claim prevents
+the association; the wrapper drains the worker before publishing `cancelled`.
+After the transaction claims completion, its actual commit/failure wins:
+`POST /v1/runs/{run_id}/stop` returns 409 (`run_completing`), and cancelling the
+async wrapper cannot publish `cancelled` over a durable completed pair. The
+wrapper retains ownership until the worker settles, even on repeated cancellation.
+Neither terminal status nor `run.completed` is published before the write ends.
+A failed transaction has no recoverable completed pair. This gate adds no durable
+execution/admission state and does not replay any messages or work.
 
 
 ### GET /v1/runs/\{run_id\}/events

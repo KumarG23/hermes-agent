@@ -10118,7 +10118,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def bind_run_messages(
         self, run_id, session_id, user_id, assistant_id, *,
-        expected_user=None, expected_answer=None,
+        expected_user=None, expected_answer=None, commit_guard=None,
     ):
         """Commit an immutable completed-run pair on the two canonical rows.
 
@@ -10133,6 +10133,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         def _do(conn):
+            # The Runs API cancels while SQLite is contended, or atomically
+            # claims completion here. The completion gate holds no lock over I/O.
+            if commit_guard is not None and not commit_guard():
+                return False
             rows = conn.execute(
                 "SELECT * FROM messages WHERE id IN (?, ?)",
                 (user_id, assistant_id),
